@@ -5,6 +5,7 @@ const app = express();
 const port = process.env.PORT || 5000;
 const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const jwt = require("jsonwebtoken");
+const stripe = require("stripe")(process.env.PAYMENT_SECRET);
 
 // middleware
 app.use(cors());
@@ -62,6 +63,10 @@ async function run() {
     const cartCollection = client
       .db("ashtaBanjanDB")
       .collection("cartCollection");
+
+    const paymentCollection = client
+      .db("ashtaBanjanDB")
+      .collection("paymentCollection");
 
     // JWT
     app.post("/jwt", (req, res) => {
@@ -216,6 +221,105 @@ async function run() {
     app.get("/review", async (req, res) => {
       const results = await reviewCollection.find().toArray();
       res.send(results);
+    });
+
+    // PAYMENT
+    app.post("/create-payment-intent", verifyJWT, async (req, res) => {
+      const { chargeAmount } = req.body;
+      const paymentIntent = await stripe.paymentIntents.create({
+        amount: parseFloat((chargeAmount * 100).toFixed(2)),
+        currency: "usd",
+        payment_method_types: ["card"],
+      });
+      res.send({
+        clientSecret: paymentIntent.client_secret,
+      });
+    });
+
+    app.get("/payment", verifyJWT, async (req, res) => {
+      const result = await paymentCollection
+        .find({ uid: { $eq: req.query.uid } })
+        .toArray();
+      res.send(result);
+    });
+
+    app.post("/payment", verifyJWT, async (req, res) => {
+      const data = req.body;
+
+      const result = await paymentCollection.insertOne(data);
+      const query = {
+        _id: { $in: data.orderItems.map((e) => new ObjectId(e._id)) },
+      };
+      await cartCollection.deleteMany(query);
+      res.send(result);
+    });
+
+    app.get("/admin-stats", verifyJWT, verifyAdmin, async (req, res) => {
+      const totalUsers = await userCollection.estimatedDocumentCount();
+      const totalRecipes = await menuCollection.estimatedDocumentCount();
+      const totalOrder = await paymentCollection.estimatedDocumentCount();
+      const revenue = await paymentCollection
+        .aggregate([
+          {
+            $group: {
+              _id: null,
+              total: { $sum: "$chargeAmount" },
+            },
+          },
+        ])
+        .toArray();
+      res.send({ totalUsers, totalRecipes, totalOrder, revenue });
+    });
+
+    app.get("/order-stats", verifyJWT, verifyAdmin, async (req, res) => {
+      const pipeline = [
+        {
+          $lookup: {
+            from: "menuCollection",
+            localField: "orderItems.category",
+            foreignField: "category",
+            as: "menuItems",
+          },
+        },
+        {
+          $unwind: "$orderItems",
+        },
+        {
+          $group: {
+            _id: "$orderItems.category",
+            totalAmount: { $sum: "$orderItems.price" },
+            totalCount: { $sum: 1 },
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            category: "$_id",
+            totalAmount: 1,
+            totalCount: 1,
+          },
+        },
+      ];
+      const results = await paymentCollection.aggregate(pipeline).toArray();
+      res.send(results);
+    });
+
+    app.get("/booking", verifyJWT, verifyAdmin, async (req, res) => {
+      const retults = await paymentCollection.find().toArray();
+      res.send(retults);
+    });
+
+    app.patch("/booking/:id", verifyJWT, verifyAdmin, async (req, res) => {
+      const id = req.params.id;
+      const data = req.body;
+      const filter = { _id: new ObjectId(id) };
+      const updatedDoc = {
+        $set: {
+          status: data.status,
+        },
+      };
+      const result = await paymentCollection.updateOne(filter, updatedDoc);
+      res.send(result);
     });
   } finally {
     app.listen(port, () => console.log("Ashta Banjan Server is running", port));
